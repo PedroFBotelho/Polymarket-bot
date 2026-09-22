@@ -30,8 +30,17 @@ Ubuntu LTS. Firewall do provedor liberando só SSH, mais o `ufw` no servidor.
 ```bash
 # usuário comum com sudo (troque "voce")
 sudo adduser voce && sudo usermod -aG sudo voce
-# copie sua chave pública para ~voce/.ssh/authorized_keys e TESTE o login por chave
-# numa segunda janela ANTES de desativar a senha (senão você se tranca fora)
+sudo mkdir -p ~voce/.ssh && sudo chmod 700 ~voce/.ssh
+# copie sua chave pública para ~voce/.ssh/authorized_keys (ex.: cole o conteúdo do
+# .pub que já está em /root/.ssh/authorized_keys, se foi a chave usada na criação do
+# droplet — NÃO use `mv`: ele preserva o dono root, e o sshd rejeita silenciosamente
+# um authorized_keys que não pertença ao usuário)
+sudo chown -R voce:voce ~voce/.ssh
+sudo chmod 600 ~voce/.ssh/authorized_keys
+# TESTE o login por chave numa segunda janela ANTES de desativar a senha
+# (senão você se tranca fora). Se der "Permission denied (publickey)" mesmo com a
+# chave certa, o suspeito nº 1 é dono/permissão: `ls -la ~voce/.ssh` deve mostrar
+# voce:voce, não root:root.
 
 # /etc/ssh/sshd_config.d/99-hardening.conf
 #   PermitRootLogin no
