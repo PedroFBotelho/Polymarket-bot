@@ -17,6 +17,11 @@ para limitar esses dois riscos.
   contornar restrições: os termos da Polymarket proíbem isso, e uma conta bloqueada pode prender o saldo.
 - **Resultados de dry-run.** Não vá para LIVE antes de ver resultados de dry-run com a liquidação paper
   (tabela "Paper Positions" na dashboard).
+- **Conta do provedor protegida, não só o servidor.** Ative 2FA na conta do provedor (DigitalOcean etc.) — quem
+  entra nela abre o console de recovery do droplet sem precisar de chave SSH nenhuma, e todo o hardening de SSH
+  abaixo fica irrelevante. Desative o backup automático do droplet (ou, se mantiver, criptografe o destino): um
+  snapshot de disco inteiro guarda `/etc/polybot/polybot.env` — com a chave privada — em texto puro. Configure
+  também o Cloud Firewall do provedor (camada de rede, fora do droplet) além do `ufw` do passo 1.
 
 ## 1. Servidor
 
@@ -103,7 +108,8 @@ Regras:
   de trocar `DRY_RUN`.
 - **`CAPITAL_USD` igual ao saldo real.** Os limites de risco são frações do `CAPITAL_USD`, não do saldo.
 - **`POLYGON_RPC_URL` seu** (Alchemy, Infura, etc.): o RPC público é instável para operar.
-- **`DASHBOARD_HOST`** fica no padrão (`127.0.0.1`). Não defina.
+- **`DASHBOARD_HOST`**: deixe no padrão (`127.0.0.1`, não defina) se for usar só o túnel SSH (seção 5.1). Se for
+  usar WireGuard para vários dispositivos (seção 5.2), defina `DASHBOARD_HOST=10.8.0.1` — só depois de subir a VPN.
 
 ## 4. Serviço systemd
 
@@ -146,14 +152,143 @@ sudo systemctl enable --now polybot
 journalctl -u polybot -f          # logs; o token aleatório só é impresso se DASHBOARD_TOKEN não estiver definido
 ```
 
-## 5. Acessar a dashboard: só por túnel SSH
+## 5. Acessar a dashboard: WireGuard (vários dispositivos) ou túnel SSH (um só)
+
+**Nunca abra a porta 3001 na internet diretamente.** Ela é protegida só por um token na URL — o acesso remoto
+tem que passar por um dos dois caminhos abaixo.
+
+### 5.1 Um dispositivo, uso ocasional: túnel SSH
+
+Não precisa de nenhum setup a mais. Funciona bem em Windows/macOS; no celular precisa de um app SSH (ex.
+Termius) e o túnel cai quando o app vai para o background.
 
 ```bash
 ssh -L 3001:127.0.0.1:3001 voce@SEU_VPS
 # depois abra http://localhost:3001/?token=SEU_TOKEN
 ```
 
-**Nunca abra a porta 3001 na internet.** Ela é protegida só por um token na URL.
+### 5.2 Vários dispositivos pessoais (laptops + celular): WireGuard
+
+Diferente de um WireGuard "de casa" (que roteia para uma rede local inteira), aqui **o próprio droplet é o
+destino** — não precisa de `iptables FORWARD`, `MASQUERADE` nem `ip_forward`. Cada dispositivo entra na VPN e
+fala direto com o droplet.
+
+**Instalar e gerar as chaves** (uma vez, no servidor — uma chave por dispositivo, nunca reaproveite):
+
+```bash
+sudo apt install -y wireguard qrencode
+sudo mkdir -p /etc/wireguard/clients && sudo chmod 700 /etc/wireguard /etc/wireguard/clients
+umask 077
+
+wg genkey | sudo tee /etc/wireguard/server_private.key | wg pubkey | sudo tee /etc/wireguard/server_public.key
+
+for peer in windows macos phone; do
+  wg genkey | sudo tee /etc/wireguard/clients/$peer.key | wg pubkey | sudo tee /etc/wireguard/clients/$peer.pub
+done
+```
+
+> Gerar as chaves dos clientes no servidor é conveniente (monta os 3 configs de uma vez), mas a chave privada de
+> cada dispositivo passa por aqui antes de chegar a ele. Depois de distribuir os configs (5.2.3), apague os
+> `.key` dos clientes do servidor: `sudo shred -u /etc/wireguard/clients/*.key`. O servidor só precisa guardar as
+> chaves **públicas** dos clientes — nunca as privadas.
+
+**5.2.1 Config do servidor** (`/etc/wireguard/wg0.conf`):
+
+```ini
+[Interface]
+Address = 10.8.0.1/24
+ListenPort = 51820
+PrivateKey = <conteúdo de server_private.key>
+
+[Peer]
+# windows
+PublicKey = <conteúdo de clients/windows.pub>
+AllowedIPs = 10.8.0.2/32
+
+[Peer]
+# macos
+PublicKey = <conteúdo de clients/macos.pub>
+AllowedIPs = 10.8.0.3/32
+
+[Peer]
+# phone
+PublicKey = <conteúdo de clients/phone.pub>
+AllowedIPs = 10.8.0.4/32
+```
+
+```bash
+sudo chmod 600 /etc/wireguard/wg0.conf
+sudo wg-quick up wg0
+sudo systemctl enable wg-quick@wg0
+```
+
+**Firewall — abrir só a porta da VPN, nas duas camadas** (droplet + provedor):
+
+```bash
+sudo ufw allow 51820/udp
+```
+
+No painel do provedor, no Cloud Firewall do droplet: liberar **UDP 51820** de entrada. Os 3 dispositivos saem de
+redes/IPs variáveis, então não dá pra restringir por IP de origem aqui — a segurança vem da chave WireGuard, não
+do IP.
+
+**5.2.2 Dashboard passa a ouvir na VPN, não em loopback:**
+
+Em `/etc/polybot/polybot.env`:
+
+```
+DASHBOARD_HOST=10.8.0.1
+```
+
+```bash
+sudo systemctl restart polybot
+```
+
+Isso desativa a checagem anti-DNS-rebinding do `server.ts` (só se aplica a bind em loopback — ver o comentário em
+`src/dashboard/server.ts`); a partir daqui a proteção é **WireGuard (só quem tem a chave entra em 10.8.0.0/24) +
+token da dashboard**. Restrinja a porta 3001 à interface da VPN, e confirme que não existe regra abrindo-a de
+forma geral:
+
+```bash
+sudo ufw allow in on wg0 to any port 3001
+sudo ufw status numbered | grep 3001   # não deve sobrar nenhuma regra "3001" sem "on wg0"
+```
+
+**5.2.3 Configs de cliente**
+
+`AllowedIPs` aponta só para o IP da VPN do droplet (10.8.0.1/32) — split tunnel: só o tráfego para o dashboard
+passa pela VPN, o resto (navegação normal) sai direto. Importa principalmente no celular.
+
+```ini
+# windows.conf (Address = 10.8.0.2/32) / macos.conf (Address = 10.8.0.3/32) / phone.conf (Address = 10.8.0.4/32)
+[Interface]
+PrivateKey = <conteúdo da .key do próprio dispositivo>
+Address = 10.8.0.X/32
+
+[Peer]
+PublicKey = <conteúdo de server_public.key>
+Endpoint = SEU_IP_DO_DROPLET:51820
+AllowedIPs = 10.8.0.1/32
+PersistentKeepalive = 25
+```
+
+- **Windows**: app oficial WireGuard (Microsoft Store ou wireguard.com/install) → importar `windows.conf`.
+- **macOS**: app oficial na Mac App Store → importar `macos.conf`.
+- **Celular**: converta `phone.conf` em QR code e escaneie direto no app WireGuard (iOS/Android têm "Scan from
+  QR code"):
+
+```bash
+qrencode -t ansiutf8 < phone.conf
+```
+
+**5.2.4 Verificação**
+
+```bash
+sudo wg show     # "latest handshake" recente para cada peer, depois de conectar
+```
+
+Com a VPN ligada em qualquer dispositivo: `http://10.8.0.1:3001/?token=SEU_TOKEN` — mesmo endereço nos 3, sem
+abrir túnel manualmente a cada vez.
 
 ## 6. Ordem de subida
 
