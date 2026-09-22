@@ -61,11 +61,14 @@
     "dotenv": "^17.2.3",
     "ethers": "5",
     "isomorphic-ws": "^5.0.0",
-    "ws": "^8.18.3"
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "tsx": "^4.7.0",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
+  },
+  "overrides": {
+    "ws": "^8.21.3"
   }
 }

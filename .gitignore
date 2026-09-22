@@ -32,3 +32,6 @@ coverage/
 .cache/
 *.tsbuildinfo
 .mcp.json
+
+# Bot runtime data (session history: PnL, balances, followed wallets)
+data/

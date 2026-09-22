@@ -1471,10 +1471,10 @@ async function main() {
   console.log('║          POLYMARKET BOT v3.2 + DASHBOARD                           ║');
   console.log('╚════════════════════════════════════════════════════════════════════╝\n');
 
-  // Start Dashboard Server (v3.2: localhost bind + optional token auth)
-  const dashToken = process.env.DASHBOARD_TOKEN;
-  startDashboard({ port: 3001, token: dashToken });
-  console.log(`\n🌐 Dashboard: http://localhost:3001${dashToken ? `/?token=${dashToken}` : ''}\n`);
+  // Start Dashboard Server (localhost bind + mandatory token auth). The
+  // server reads DASHBOARD_TOKEN itself, generates a random per-run token if
+  // it is unset, and prints the access URL — the env token is never echoed.
+  startDashboard({ port: 3001 });
 
   if (!process.env.POLYMARKET_PRIVATE_KEY) {
     log('ERROR', 'POLYMARKET_PRIVATE_KEY not found');

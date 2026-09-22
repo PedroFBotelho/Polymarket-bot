@@ -168,11 +168,12 @@ TOTAL_MAX_LOSS_PCT=0.40      # 40% total loss = permanent halt
 # Get a free key from Alchemy/Infura/QuickNode and paste the HTTPS URL
 # POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
 
-# Dashboard security (Optional)
-# The dashboard binds to localhost (127.0.0.1) by default. To reach it from
-# another machine, set DASHBOARD_HOST=0.0.0.0 AND set a long random token —
-# the token is required on the API/WebSocket and the bot prints the full
-# dashboard URL (including ?token=...) at startup.
+# Dashboard security
+# The dashboard binds to localhost (127.0.0.1) by default and ALWAYS requires
+# a token on the API/WebSocket. If DASHBOARD_TOKEN is unset, a random token is
+# generated on each start and the access URL (?token=...) is printed once.
+# To reach it from another machine, set DASHBOARD_HOST=0.0.0.0 AND a long
+# random DASHBOARD_TOKEN.
 # DASHBOARD_HOST=127.0.0.1
 # DASHBOARD_TOKEN=generate-a-long-random-string
 ```
@@ -196,7 +197,7 @@ npx tsx bot-with-dashboard.ts
 ### What happens next?
 1. The terminal will show startup logs.
 2. It will verify your wallet connection.
-3. **The Dashboard URL is printed in the terminal** at `http://localhost:3001` (if you set `DASHBOARD_TOKEN`, the printed URL includes `?token=...` — open that exact link).
+3. **The Dashboard URL is printed in the terminal** at `http://localhost:3001`. Access always needs a token: if `DASHBOARD_TOKEN` is unset, the printed URL includes a random `?token=...` for this run — open that exact link. If you set `DASHBOARD_TOKEN` yourself, append `?token=<your token>` to the URL.
 
 If it doesn't open by itself, copy the URL from the terminal.
 
