@@ -126,6 +126,19 @@ export interface SmartMoneyWallet {
 }
 
 /**
+ * What our own copy of a whale trade was sized to. Distinct from the whale's
+ * print: `size`/`usdcAmount` are AFTER sizeScale and the maxSizePerTrade cap.
+ */
+export interface CopyFill {
+  /** Tokens (shares) in our copy. */
+  size: number;
+  /** Notional (USDC) of our copy — what a live order would spend/receive. */
+  usdcAmount: number;
+  /** Slippage-adjusted limit price used for the copy. */
+  price: number;
+}
+
+/**
  * Smart Money trade from Activity WebSocket
  */
 export interface SmartMoneyTrade {
@@ -220,8 +233,13 @@ export interface AutoCopyTradingOptions {
    */
   preExecutionGuard?: PreExecutionGuard;
 
-  /** Callbacks */
-  onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
+  /**
+   * Callbacks.
+   * `trade` is the WHALE's print (its size, its price). `copy` is what OUR
+   * copy actually sized to (after sizeScale and maxSizePerTrade) — use it,
+   * not `trade.size * trade.price`, for any volume/exposure accounting.
+   */
+  onTrade?: (trade: SmartMoneyTrade, result: OrderResult, copy: CopyFill) => void;
   /**
    * Fired when an executed copy closes (part of) a tracked lot, with the
    * realized PnL for that close (USDC, net of estimated fees). This is the
@@ -1373,7 +1391,7 @@ export class SmartMoneyService {
             this.bumpWalletCounter(stats, walletAddr, 'failed');
           }
 
-          options.onTrade?.(trade, result);
+          options.onTrade?.(trade, result, { size: copySize, usdcAmount, price: slippagePrice });
         } catch (error) {
           stats.tradesFailed++;
           options.onError?.(error instanceof Error ? error : new Error(String(error)));

@@ -648,13 +648,15 @@ async function startSmartMoneyCopy(sdk: PolymarketSDK) {
       delay: CONFIG.smartMoney.delay,
       dryRun: CONFIG.dryRun,          // service simulates fills AND closes
       preExecutionGuard: riskGuard,   // BUY copies only (service bypasses SELLs)
-      onTrade: (trade, result) => {
+      onTrade: (trade, result, copy) => {
         if (result.success && trade.side === 'BUY') {
           recordEntry('smartMoney');
-          log('TRADE', `Copied BUY from ${trade.traderAddress.slice(0, 8)}... (${trade.size.toFixed(1)} sh @ ${trade.price})`);
+          // `trade` is the whale's print; `copy` is what WE sized to. Report
+          // and account with the copy (the whale's notional can be 1000x ours).
+          log('TRADE', `Copied BUY ${trade.outcome ?? '?'} on ${(trade.marketSlug ?? trade.conditionId ?? 'unknown market').slice(0, 48)} from ${trade.traderAddress.slice(0, 8)}...: $${copy.usdcAmount.toFixed(2)} (${copy.size.toFixed(2)} sh @ ${copy.price.toFixed(3)}) — whale traded ${trade.size.toFixed(1)} sh @ ${trade.price}`);
           if (CONFIG.dryRun && state.paper) {
             state.paper.trades++;
-            state.paper.totalVolume += trade.size * trade.price;
+            state.paper.totalVolume += copy.usdcAmount;
             updateDashboard();
           }
         }
