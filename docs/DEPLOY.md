@@ -328,7 +328,10 @@ abrir túnel manualmente a cada vez.
 - **Atualizar**: `git pull`, `npm ci --ignore-scripts`, `(cd dashboard && npm ci --ignore-scripts && npm run build)`,
   `sudo systemctl restart polybot`.
 - **Parar**: `sudo systemctl stop polybot`.
-- **Se suspeitar de invasão**: pare o serviço, retire os fundos, revogue as aprovações (revoke.cash) e gere outra chave.
+- **Se suspeitar de invasão**: pare o serviço, retire os fundos (`PRIVATE_KEY=0x... npx tsx scripts/wallet/withdraw.ts usdce SEU_ENDERECO_SEGURO all`,
+  depois o mesmo com `matic`), revogue as aprovações (revoke.cash) e gere outra chave.
+- **Sacar fundos em qualquer outra situação** (não só invasão): mesmo comando acima, rodado no servidor —
+  a chave nunca vai como argumento de linha de comando (ficaria no histórico do shell), só via `PRIVATE_KEY`.
 
 ## 8. Plano de escala de capital: $100 → $1000
 
