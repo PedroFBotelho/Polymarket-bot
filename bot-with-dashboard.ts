@@ -2014,7 +2014,9 @@ async function main() {
     console.log(`  Status:         ${state.permanentlyHalted ? '🛑 HALTED' : state.isPaused ? '⏸️ PAUSED' : '▶️ ACTIVE'}`);
     console.log(`  Exposure:       $${state.totalExposureUsd.toFixed(2)} / $${(CONFIG.capital.totalUsd * CONFIG.capital.maxTotalExposurePct).toFixed(2)} cap`);
     console.log('─'.repeat(70));
-    console.log('  BALANCES:');
+    // In DRY RUN these are mock numbers (updateBalances() never queries the
+    // chain) — label them so nobody mistakes them for the real wallet.
+    console.log(`  BALANCES:${CONFIG.dryRun ? ' [SIMULADO — não é saldo real on-chain]' : ''}`);
     console.log(`    MATIC:        ${state.maticBalance.toFixed(4)}`);
     console.log(`    USDC:         $${state.usdcBalance.toFixed(2)}`);
     console.log(`    USDC.e:       $${state.usdcEBalance.toFixed(2)}`);
