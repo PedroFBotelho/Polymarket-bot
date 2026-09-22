@@ -126,12 +126,16 @@ export function SmartMoneyPanel({ state }: SmartMoneyPanelProps) {
             </div>
             <div className="flex flex-wrap gap-2">
               {followedWallets.slice(0, 5).map((wallet) => (
-                <code
+                <a
                   key={wallet}
-                  className="px-2 py-1 bg-poly-dark/50 rounded text-xs text-gray-400 font-mono"
+                  href={`https://polygonscan.com/address/${wallet}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={`${wallet} — view on Polygonscan`}
+                  className="px-2 py-1 bg-poly-dark/50 hover:bg-poly-dark rounded text-xs text-gray-400 hover:text-white font-mono transition-colors"
                 >
                   {shortenAddress(wallet)}
-                </code>
+                </a>
               ))}
               {followedWallets.length > 5 && (
                 <span className="px-2 py-1 text-xs text-gray-500">
