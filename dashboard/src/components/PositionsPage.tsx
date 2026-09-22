@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { BotState } from '../types';
+import { PaperPositionsTable } from './PaperPositionsTable';
 
 interface PositionsPageProps {
     onBack: () => void;
@@ -13,6 +14,9 @@ export function PositionsPage({ onBack, state, onClosePosition, onRedeemPosition
     const [redeemingId, setRedeemingId] = useState<string | null>(null);
 
     const positions = state?.positions || [];
+    // Simulated trades (DRY RUN only — the bot sends none in LIVE).
+    const paperRows = state?.paper?.positions ?? [];
+    const paperOpen = paperRows.filter(r => r.status === 'open').length;
 
     const formatPnL = (value: number) => {
         const formatted = Math.abs(value).toFixed(2);
@@ -53,6 +57,12 @@ export function PositionsPage({ onBack, state, onClosePosition, onRedeemPosition
 
                     {/* Summary Stats */}
                     <div className="flex items-center gap-6">
+                        {paperRows.length > 0 && (
+                            <div className="text-right">
+                                <div className="text-xs text-gray-500 uppercase tracking-wider">Paper open</div>
+                                <div className="text-xl font-bold font-mono text-cyan-400">{paperOpen}</div>
+                            </div>
+                        )}
                         <div className="text-right">
                             <div className="text-xs text-gray-500 uppercase tracking-wider">Positions</div>
                             <div className="text-xl font-bold font-mono">{positions.length}</div>
@@ -61,15 +71,18 @@ export function PositionsPage({ onBack, state, onClosePosition, onRedeemPosition
                 </div>
             </header>
 
-            <main className="p-6 max-w-[1600px] mx-auto">
+            <main className="p-6 max-w-[1600px] mx-auto space-y-4">
+                {paperRows.length > 0 && <PaperPositionsTable rows={paperRows} />}
                 {positions.length === 0 ? (
-                    <div className="panel p-12 text-center">
-                        <div className="text-6xl mb-4">📭</div>
-                        <h2 className="text-xl font-semibold mb-2">No Open Positions</h2>
-                        <p className="text-gray-400">
-                            You don't have any open positions yet. Start trading to see them here.
-                        </p>
-                    </div>
+                    paperRows.length > 0 ? null : (
+                        <div className="panel p-12 text-center">
+                            <div className="text-6xl mb-4">📭</div>
+                            <h2 className="text-xl font-semibold mb-2">No Open Positions</h2>
+                            <p className="text-gray-400">
+                                You don't have any open positions yet. Start trading to see them here.
+                            </p>
+                        </div>
+                    )
                 ) : (
                     <div className="space-y-4 animate-fade-in">
                         {/* Positions Table */}
