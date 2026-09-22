@@ -35,12 +35,20 @@ import {
   type PreExecutionGuard,
 } from './src/utils/risk.js';
 import { fetchClosedPnls } from './src/utils/closed-positions.js';
+import { parseWalletList } from './src/utils/wallet-list.js';
 
 // ============================================================================
 // CONFIGURATION (same as bot-config.ts)
 // ============================================================================
 
 const CAPITAL_USD = parseFloat(process.env.CAPITAL_USD || '250');
+
+// Wallets to follow on top of the leaderboard: CUSTOM_WALLETS in .env
+// (comma-separated). Typos are reported, never silently dropped.
+const CUSTOM_WALLETS = parseWalletList(process.env.CUSTOM_WALLETS);
+if (CUSTOM_WALLETS.invalid.length > 0) {
+  console.warn(`[config] CUSTOM_WALLETS: ignoring ${CUSTOM_WALLETS.invalid.length} invalid entr${CUSTOM_WALLETS.invalid.length === 1 ? 'y' : 'ies'} (expected 0x + 40 hex chars): ${CUSTOM_WALLETS.invalid.join(', ')}`);
+}
 
 let CONFIG = {
   capital: {
@@ -81,7 +89,9 @@ let CONFIG = {
   },
 
   smartMoney: {
-    enabled: process.env.SMARTMONEY_ENABLED !== 'false',
+    // Opt-in (matches .env.example and the other strategies): copy trading
+    // must be enabled explicitly with SMARTMONEY_ENABLED=true.
+    enabled: process.env.SMARTMONEY_ENABLED === 'true',
     topN: 20,
     // 🔴 FIXED: Stricter criteria (v3.1)
     minWinRate: 0.60,  // Up from 0.70 to match bot-config (60%+)
@@ -102,10 +112,12 @@ let CONFIG = {
     maxSlippage: 0.03,
     minTradeSize: 10,  // Up from 5
     delay: 500,
-    customWallets: [
-      '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',
-      '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',
-    ] as string[],
+    // Wallets to follow in addition to the leaderboard, from the CUSTOM_WALLETS
+    // env var (see CUSTOM_WALLETS above). Empty by default: nothing is followed
+    // unless you chose it. Each wallet must still pass the quality gates above
+    // (win rate, profit factor, consistency, min PnL / trades): a rejected
+    // wallet is logged ("Custom wallet rejected") and NOT followed.
+    customWallets: CUSTOM_WALLETS.wallets,
   },
 
   arbitrage: {

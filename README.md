@@ -176,6 +176,11 @@ TOTAL_MAX_LOSS_PCT=0.40      # 40% total loss = permanent halt
 # random DASHBOARD_TOKEN.
 # DASHBOARD_HOST=127.0.0.1
 # DASHBOARD_TOKEN=generate-a-long-random-string
+
+# Extra wallets to copy-trade on top of the leaderboard (comma-separated).
+# Empty by default. Each must still pass the quality gates: rejected wallets
+# are logged and NOT followed. Only add wallets you have vetted yourself.
+# CUSTOM_WALLETS=0xabc...,0xdef...
 ```
 
 **⚠️ IMPORTANT:** 

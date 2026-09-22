@@ -48,7 +48,7 @@ export function WalletList({ state }: WalletListProps) {
           <div className="text-center py-8">
             <div className="text-4xl mb-3">🔍</div>
             <div className="text-gray-400">No wallets configured</div>
-            <div className="text-xs text-gray-500 mt-1">Add wallets in bot-config.ts</div>
+            <div className="text-xs text-gray-500 mt-1">Set CUSTOM_WALLETS in .env, or enable Smart Money to follow the leaderboard</div>
           </div>
         ) : (
           <div className="space-y-3">
