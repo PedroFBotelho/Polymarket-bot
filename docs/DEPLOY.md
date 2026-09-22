@@ -325,6 +325,60 @@ abrir túnel manualmente a cada vez.
 - **Parar**: `sudo systemctl stop polybot`.
 - **Se suspeitar de invasão**: pare o serviço, retire os fundos, revogue as aprovações (revoke.cash) e gere outra chave.
 
+## 8. Plano de escala de capital: $100 → $1000
+
+> Os limiares abaixo vêm de uma fórmula real do código, não de "quando parecer confortável": `canOpenPosition`
+> em `bot-with-dashboard.ts` calcula `perTradeCap = CAPITAL_USD × maxPerTradePct` (2%, fixo no código) e
+> bloqueia qualquer trade — de qualquer estratégia — acima desse teto. Cada estratégia tem seu próprio valor
+> mínimo de trade, então o capital necessário pra ela sair do papel é diferente:
+
+| Estratégia | Mínimo de trade | Capital onde o teto de 2% empata | Capital com margem confortável (~2x) |
+|---|---|---|---|
+| Smart Money | $1 (mínimo Polymarket) | $50 | **$100** |
+| DipArb | $1,50 (`minTradeValueUSD`) | $75 | **$150** |
+| Arbitrage | $20 (`minTradeSize`) | $1000 | **$1200–1500** |
+
+Em exatamente $1000 o teto do Arbitrage EMPATA com o mínimo — sujeito a ficar de fora por arredondamento ou
+o preço do momento. Por isso o estágio 4 abaixo aponta pra $1200-1500, não $1000 seco.
+
+**Alternativa mais rápida que acumular capital**: ajustar o código (reduzir `arbitrage.minTradeSize` de $20,
+ou dar ao Arbitrage um `maxPerTradePct` próprio maior) chega ao mesmo resultado sem esperar juntar $1000+.
+Não fizemos isso aqui porque o caminho escolhido foi escalar o capital — mas é uma opção se quiser chegar lá
+mais rápido.
+
+### Estágio 1 — $100, DRY_RUN, só Smart Money (ponto de partida)
+- `.env`: `CAPITAL_USD=100`, `SMARTMONEY_ENABLED=true`, `ARBITRAGE_ENABLED=false`, `DIPARB_ENABLED=false`,
+  `TREND_ANALYSIS_ENABLED=false`, `DRY_RUN=true`.
+- **Critério de saída** (evidência, não prazo fixo):
+  - Cópias reais aparecendo na tabela "Paper Positions" (não zero).
+  - Pelo menos UMA liquidação (`[SIMULATION] Settled …` no log) contra um mercado que resolveu de verdade.
+  - Resumo do copy engine (`📊 Copy engine …`) sem taxa de skip anormal (`quote_guard`/`risk_guard` dominando).
+  - 48h corridas sem erro inesperado nos logs.
+
+### Estágio 2 — ainda $100, LIVE, só Smart Money
+- Só depois do Estágio 1 confirmado. `DRY_RUN=false`, mesmo capital pequeno — aqui o objetivo é validar
+  execução REAL (fees, confirmação on-chain, aprovações), não ainda medir se a estratégia é lucrativa.
+- Na primeira subida em LIVE, confirme `✅ All approvals ready` e `PnL baseline anchored` no log.
+- Vigie as primeiras cópias na Polygonscan, Emergency Stop à mão (seção 6, já cobria isso).
+
+### Estágio 3 — $150+, LIVE, Smart Money + DipArb
+- Só suba `CAPITAL_USD` quando esse saldo estiver de fato na carteira (regra da seção 3).
+- Ligue `DIPARB_ENABLED=true`.
+- Critério de saída específico do DipArb: pelo menos um ciclo Leg1→Leg2 completo sem o stop-loss de 20%
+  disparar por erro de hedge (não por movimento normal de mercado).
+
+### Estágio 4 — $1200–1500, LIVE, tudo junto (inclui Arbitrage)
+- Ligue `ARBITRAGE_ENABLED=true` só aqui.
+- Confirme no log que o Arbitrage está de fato abrindo posições (não só escaneando) — se `Position blocked:
+  ... exceeds per-trade cap` aparecer, o capital ainda não está alto o suficiente.
+
+### Regra em toda transição de estágio
+- `CAPITAL_USD` no `.env` = saldo real na carteira, sempre (nunca declare mais do que tem — os limites de
+  risco perdem sentido).
+- Teste qualquer estratégia nova em DRY_RUN por algumas horas antes de ir para LIVE, mesmo já tendo rodado
+  LIVE com outra estratégia antes.
+- `sudo systemctl restart polybot` depois de qualquer mudança no `.env`.
+
 ## Cuidados específicos deste bot
 
 - **Reinício zera os contadores de risco.** Pelo código, a perda diária/mensal e a sequência de perdas ficam só em
