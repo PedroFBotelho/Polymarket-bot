@@ -205,6 +205,8 @@ export type {
   ReportProgressCallback,
   LifecycleReportOptions,
   TextReport,
+  CopyFill,
+  CopySkipReason,
 } from './services/smart-money-service.js';
 
 // DipArbService - Dip Arbitrage for 15m/5m UP/DOWN markets

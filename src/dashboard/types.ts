@@ -91,7 +91,34 @@ export interface BotState {
     pnl: number;
     trades: number;
     totalVolume: number;
+    /** Simulated positions still awaiting market resolution. */
+    openPositions?: number;
+    /** USDC cost basis of those open positions (not yet in PnL). */
+    openCostUsd?: number;
+    /** Copied/simulated trades: open ones first, then recently finished. */
+    positions?: PaperPositionRow[];
   };
+}
+
+/** One simulated (paper) position, open or finished — mirrors PaperRow in utils/paper-ledger. */
+export interface PaperPositionRow {
+  id: string;
+  strategy: 'smartMoney' | 'direct';
+  market: string;
+  outcome?: string;
+  /** Followed wallet whose trade was copied. */
+  wallet?: string;
+  size: number;
+  costUsd: number;
+  /** costUsd / size. */
+  entryPrice: number;
+  /** ms since epoch. */
+  openedAt: number;
+  /** open | won / lost (market resolved) | closed (a followed wallet sold). */
+  status: 'open' | 'won' | 'lost' | 'closed';
+  closedAt?: number;
+  payoutUsd?: number;
+  pnlUsd?: number;
 }
 
 export interface DipArbSignal {

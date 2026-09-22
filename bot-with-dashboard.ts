@@ -17,6 +17,7 @@ import {
   type SmartMoneyTrade,
   type AutoCopyTradingSubscription,
   type DipArbRoundResult,
+  type CopySkipReason,
   OnchainService,
 } from './src/index.js';
 import { CTFClient } from './src/clients/ctf-client.js';
@@ -35,12 +36,24 @@ import {
   type PreExecutionGuard,
 } from './src/utils/risk.js';
 import { fetchClosedPnls } from './src/utils/closed-positions.js';
+import { PaperLedger, payoutsFromMarket, type PaperSettlement } from './src/utils/paper-ledger.js';
+import { parseWalletList } from './src/utils/wallet-list.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 // ============================================================================
 // CONFIGURATION (same as bot-config.ts)
 // ============================================================================
 
 const CAPITAL_USD = parseFloat(process.env.CAPITAL_USD || '250');
+
+// Wallets to follow on top of the leaderboard: CUSTOM_WALLETS in .env
+// (comma-separated). Typos are reported, never silently dropped.
+const CUSTOM_WALLETS = parseWalletList(process.env.CUSTOM_WALLETS);
+if (CUSTOM_WALLETS.invalid.length > 0) {
+  console.warn(`[config] CUSTOM_WALLETS: ignoring ${CUSTOM_WALLETS.invalid.length} invalid entr${CUSTOM_WALLETS.invalid.length === 1 ? 'y' : 'ies'} (expected 0x + 40 hex chars): ${CUSTOM_WALLETS.invalid.join(', ')}`);
+}
 
 let CONFIG = {
   capital: {
@@ -81,7 +94,9 @@ let CONFIG = {
   },
 
   smartMoney: {
-    enabled: process.env.SMARTMONEY_ENABLED !== 'false',
+    // Opt-in (matches .env.example and the other strategies): copy trading
+    // must be enabled explicitly with SMARTMONEY_ENABLED=true.
+    enabled: process.env.SMARTMONEY_ENABLED === 'true',
     topN: 20,
     // 🔴 FIXED: Stricter criteria (v3.1)
     minWinRate: 0.60,  // Up from 0.70 to match bot-config (60%+)
@@ -102,10 +117,12 @@ let CONFIG = {
     maxSlippage: 0.03,
     minTradeSize: 10,  // Up from 5
     delay: 500,
-    customWallets: [
-      '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',
-      '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',
-    ] as string[],
+    // Wallets to follow in addition to the leaderboard, from the CUSTOM_WALLETS
+    // env var (see CUSTOM_WALLETS above). Empty by default: nothing is followed
+    // unless you chose it. Each wallet must still pass the quality gates above
+    // (win rate, profit factor, consistency, min PnL / trades): a rejected
+    // wallet is logged ("Custom wallet rejected") and NOT followed.
+    customWallets: CUSTOM_WALLETS.wallets,
   },
 
   arbitrage: {
@@ -257,7 +274,17 @@ function log(level: LogLevel, message: string, data?: unknown) {
   dashboardEmitter.log(level, message, data);
 }
 
+// DRY RUN: simulated positions awaiting resolution (see PAPER SETTLEMENT below).
+const paperLedger = new PaperLedger();
+
 function updateDashboard() {
+  if (state.paper) {
+    state.paper.openPositions = paperLedger.openCount();
+    state.paper.openCostUsd = paperLedger.openCostUsd();
+    // The table of copied trades (open + recently finished). Only meaningful in
+    // DRY RUN; in LIVE the real Positions view is used instead.
+    state.paper.positions = CONFIG.dryRun ? paperLedger.rows() : [];
+  }
   dashboardEmitter.updateState(state);
 }
 
@@ -516,6 +543,93 @@ function recordTradeForHistory(trade: Omit<TradeRecord, 'id' | 'timestamp'>) {
   if (sessionTrades.length > 500) sessionTrades.splice(0, sessionTrades.length - 500);
 }
 
+// ============================================================================
+// PAPER SETTLEMENT (DRY RUN)
+// Simulated copies / direct buys are remembered in paperLedger and scored when
+// their market resolves: winning shares pay $1, losing shares $0. Without this
+// a position held to resolution stayed at $0 PnL forever — only a followed
+// wallet's SELL ever booked anything. Voided / undecided markets stay open.
+// ============================================================================
+const PAPER_SETTLE_INTERVAL_MS = 60_000;
+const PAPER_SETTLE_MAX_MARKETS_PER_PASS = 25;
+let paperSettling = false;
+
+// Paper positions survive a restart: the ledger is written to
+// data/paper-positions.json (gitignored) after every change and reloaded at
+// startup, so an unresolved copy is still scored after you close the bot.
+const PAPER_LEDGER_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'paper-positions.json');
+
+function savePaperLedger() {
+  // Paper state is only ever written from a DRY RUN session: a LIVE session
+  // holds an empty ledger and must not overwrite the saved paper history.
+  if (!CONFIG.dryRun) return;
+  try {
+    fs.mkdirSync(path.dirname(PAPER_LEDGER_FILE), { recursive: true });
+    const tmp = `${PAPER_LEDGER_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(paperLedger.toJSON()));
+    fs.renameSync(tmp, PAPER_LEDGER_FILE); // atomic: a crash mid-write never leaves a torn file
+  } catch { /* persistence must never break trading */ }
+}
+
+function loadPaperLedger() {
+  try {
+    if (!fs.existsSync(PAPER_LEDGER_FILE)) return;
+    const restored = paperLedger.restore(JSON.parse(fs.readFileSync(PAPER_LEDGER_FILE, 'utf-8')));
+    if (restored.open > 0 || restored.finished > 0) {
+      log('INFO', `📝 Restored ${restored.open} open / ${restored.finished} finished paper position(s) from the previous session ($${paperLedger.openCostUsd().toFixed(2)} still at risk)`);
+    }
+  } catch {
+    log('WARN', 'Could not read data/paper-positions.json (corrupt?) — starting with an empty paper ledger');
+  }
+}
+
+function bookPaperSettlement(s: PaperSettlement) {
+  const { position: p, pnlUsd } = s;
+  if (state.paper) {
+    state.paper.pnl += pnlUsd;
+    state.paper.balance += pnlUsd;
+  }
+  // Same path a simulated close already takes: daily/monthly PnL, W/L
+  // counters and the loss-streak tracker all see the settled result.
+  recordRealized(pnlUsd);
+  recordTradeForHistory({
+    strategy: p.strategy,
+    market: p.market,
+    side: 'SELL',
+    size: p.size,
+    price: s.payoutPerShare,
+    profit: pnlUsd,
+  });
+  log(
+    'TRADE',
+    `[SIMULATION] Settled ${p.strategy} ${p.outcome ?? 'position'} on ${p.market.slice(0, 40)}: ` +
+    `${s.won ? 'WON' : 'LOST'} — ${p.size.toFixed(2)} sh × $${s.payoutPerShare.toFixed(2)} = $${s.payoutUsd.toFixed(2)} ` +
+    `vs $${p.costUsd.toFixed(2)} cost → PnL ${pnlUsd >= 0 ? '+' : '-'}$${Math.abs(pnlUsd).toFixed(2)}`,
+  );
+}
+
+async function settlePaperPositions(sdk: PolymarketSDK) {
+  if (paperSettling || !CONFIG.dryRun || paperLedger.openCount() === 0) return;
+  paperSettling = true;
+  try {
+    for (const conditionId of paperLedger.conditionIds(PAPER_SETTLE_MAX_MARKETS_PER_PASS)) {
+      try {
+        const market = await sdk.markets.getMarket(conditionId);
+        const payouts = payoutsFromMarket(market);
+        if (!payouts) continue;
+        // Mode may have flipped to LIVE while awaiting: never book paper PnL then.
+        if (!CONFIG.dryRun) return;
+        const settled = paperLedger.settleMarket(conditionId, payouts);
+        for (const s of settled) bookPaperSettlement(s);
+        if (settled.length > 0) savePaperLedger();
+      } catch { /* transient API error — retried on the next pass */ }
+    }
+  } finally {
+    paperSettling = false;
+    updateDashboard();
+  }
+}
+
 function persistSession() {
   try {
     const session = createSessionFromState(
@@ -623,6 +737,49 @@ async function reconcilePnl() {
 // handles stale-print skipping, live re-quotes, per-wallet circuit breaker;
 // riskGuard gates BUY copies; onCopyPnl books realized FIFO PnL.
 // dryRun is captured at subscription start → must restart on mode flip.
+// Why the copy engine did NOT mirror a followed wallet's trade. Small prints,
+// side filters and risk blocks are only counted (the first two are far too
+// chatty; riskGuard already logs its own WARN). Everything else is logged, but
+// capped per reason per summary window so a burst can't bury the activity log.
+const SKIP_LABELS: Record<CopySkipReason, string> = {
+  wallet_cooldown: 'wallet paused after failures',
+  below_min_value: 'too small',
+  side_filter: 'side filter',
+  stale: 'stale print',
+  below_min_order: 'below $1 minimum order',
+  no_token: 'no token id',
+  quote_guard: 'live quote guard',
+  risk_guard: 'risk limits',
+};
+const SKIP_LOG_BUDGET_PER_REASON = 5;
+const skipLogBudget: Partial<Record<CopySkipReason, number>> = {};
+
+function logCopySkip(trade: SmartMoneyTrade, reason: CopySkipReason, detail?: string) {
+  if (reason === 'below_min_value' || reason === 'side_filter' || reason === 'risk_guard') return;
+  const used = skipLogBudget[reason] ?? 0;
+  if (used >= SKIP_LOG_BUDGET_PER_REASON) return; // still counted; shown in the summary
+  skipLogBudget[reason] = used + 1;
+  log('INFO', `⏭️ Not copied — ${SKIP_LABELS[reason]}: ${trade.side} by ${trade.traderAddress.slice(0, 8)}...${detail ? ` (${detail})` : ''}`);
+}
+
+// Periodic scoreboard so "signals but no copies" is never a mystery. Counters
+// are cumulative since the copy engine started.
+function logCopyEngineSummary() {
+  for (const k of Object.keys(skipLogBudget)) delete skipLogBudget[k as CopySkipReason];
+  const s = copySubscription?.getStats();
+  if (!s) return;
+  const mins = Math.max(1, Math.round((Date.now() - s.startTime) / 60000));
+  if (s.tradesDetected === 0) {
+    log('INFO', `📊 Copy engine (${mins}m): no trades from followed wallets yet`);
+    return;
+  }
+  const r = s.skipReasons;
+  const parts = (Object.keys(r) as CopySkipReason[])
+    .filter(k => r[k] > 0)
+    .map(k => `${SKIP_LABELS[k]} ${r[k]}`);
+  log('INFO', `📊 Copy engine (${mins}m): ${s.tradesDetected} followed-wallet trades → ${s.tradesExecuted} copied, ${s.tradesSkipped} skipped${parts.length ? ` [${parts.join(' · ')}]` : ''}`);
+}
+
 async function startSmartMoneyCopy(sdk: PolymarketSDK) {
   if (!CONFIG.smartMoney.enabled || state.followedWallets.length === 0) return;
   if (copySubscription?.isActive) return;
@@ -636,17 +793,33 @@ async function startSmartMoneyCopy(sdk: PolymarketSDK) {
       delay: CONFIG.smartMoney.delay,
       dryRun: CONFIG.dryRun,          // service simulates fills AND closes
       preExecutionGuard: riskGuard,   // BUY copies only (service bypasses SELLs)
-      onTrade: (trade, result) => {
+      onTrade: (trade, result, copy) => {
         if (result.success && trade.side === 'BUY') {
           recordEntry('smartMoney');
-          log('TRADE', `Copied BUY from ${trade.traderAddress.slice(0, 8)}... (${trade.size.toFixed(1)} sh @ ${trade.price})`);
+          // `trade` is the whale's print; `copy` is what WE sized to. Report
+          // and account with the copy (the whale's notional can be 1000x ours).
+          log('TRADE', `Copied BUY ${trade.outcome ?? '?'} on ${(trade.marketSlug ?? trade.conditionId ?? 'unknown market').slice(0, 48)} from ${trade.traderAddress.slice(0, 8)}...: $${copy.usdcAmount.toFixed(2)} (${copy.size.toFixed(2)} sh @ ${copy.price.toFixed(3)}) — whale traded ${trade.size.toFixed(1)} sh @ ${trade.price}`);
           if (CONFIG.dryRun && state.paper) {
             state.paper.trades++;
-            state.paper.totalVolume += trade.size * trade.price;
+            state.paper.totalVolume += copy.usdcAmount;
+            // Remember the simulated position so it is scored at resolution.
+            paperLedger.open({
+              strategy: 'smartMoney',
+              tokenId: trade.tokenId ?? '',
+              conditionId: trade.conditionId ?? '',
+              market: trade.marketSlug ?? trade.conditionId ?? 'unknown',
+              outcome: trade.outcome,
+              wallet: trade.traderAddress,
+              size: copy.size,
+              costUsd: copy.usdcAmount,
+              openedAt: Date.now(),
+            });
+            savePaperLedger();
             updateDashboard();
           }
         }
       },
+      onSkip: logCopySkip,
       onCopyPnl: (info) => {
         log('TRADE', `Copy closed ${info.closedSize.toFixed(2)} sh — PnL $${info.realizedUsd.toFixed(2)}`);
         recordRealized(info.realizedUsd);
@@ -654,6 +827,10 @@ async function startSmartMoneyCopy(sdk: PolymarketSDK) {
         if (CONFIG.dryRun && state.paper) {
           state.paper.pnl += info.realizedUsd;
           state.paper.balance += info.realizedUsd;
+          // A followed wallet sold: that lot is realized above, so it must
+          // not be settled a second time at resolution.
+          paperLedger.reduce(info.tokenId, info.closedSize, info.realizedUsd);
+          savePaperLedger();
         }
       },
       onError: (err) => log('ERROR', `Copy trading error: ${err.message}`),
@@ -805,9 +982,11 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   updateDashboard();
 
   if (qualified.length > 0) {
-    // Subscribe to smart money trades with address filter — SIGNAL FEED ONLY.
-    // Execution lives in startAutoCopyTrading (guard + realized PnL +
-    // circuit breaker); this handler just mirrors trades to the dashboard.
+    // Signal feed for the dashboard — followed wallets ONLY (the filter is
+    // passed as the 2nd argument below; without it this handler used to see
+    // every trade on Polymarket and log them all as "copy signals").
+    // A signal is NOT a copy: execution lives in startAutoCopyTrading (guard +
+    // realized PnL + circuit breaker), which logs why it skips a trade.
     sdk.smartMoney.subscribeSmartMoneyTrades(
       async (trade: SmartMoneyTrade) => {
         if (!CONFIG.smartMoney.enabled) return;
@@ -826,14 +1005,15 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
           state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
         }
 
-        log('SIGNAL', `Copy trade signal from ${trade.traderAddress.slice(0, 10)}...`, {
+        log('SIGNAL', `Followed wallet ${trade.traderAddress.slice(0, 10)}... traded (copy engine decides whether to mirror it)`, {
           market: trade.marketSlug?.slice(0, 50),
           side: trade.side,
           size: trade.size,
           price: trade.price,
         });
         updateDashboard();
-      });
+      },
+      { filterAddresses: qualified });
 
     // v3.2: full auto-copy execution (dry-run simulates fills via the service)
     await startSmartMoneyCopy(sdk);
@@ -1346,15 +1526,27 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
               }
 
               if (CONFIG.dryRun) {
-                // DRY RUN: book entry + paper movement. Realized PnL for
-                // direct positions is only booked on a real close, which the
-                // simulator never performs — so no directEntries record is
-                // kept (it could never be consumed and would grow unbounded).
+                // DRY RUN: book entry + paper movement. The simulator never
+                // performs a close for direct positions, so no directEntries
+                // record is kept (it could never be consumed and would grow
+                // unbounded). Realized PnL comes from paper settlement: the
+                // ledger scores the position when its market resolves.
                 recordEntry('direct');
                 if (state.paper) {
                   state.paper.trades++;
                   state.paper.totalVolume += amountUsdc;
                 }
+                paperLedger.open({
+                  strategy: 'direct',
+                  tokenId: targetToken.tokenId,
+                  conditionId: String(market.conditionId),
+                  market: market.question ?? String(market.conditionId),
+                  outcome: targetToken.outcome,
+                  size: amountUsdc / price,
+                  costUsd: amountUsdc,
+                  openedAt: Date.now(),
+                });
+                savePaperLedger();
                 log('TRADE', `[SIMULATION] Direct trend buy: ${market.question?.slice(0, 40)}... → ${trend.toUpperCase()} (Buy ${targetToken.outcome}) @ ${price.toFixed(2)}`);
                 updateDashboard();
               } else {
@@ -1471,10 +1663,10 @@ async function main() {
   console.log('║          POLYMARKET BOT v3.2 + DASHBOARD                           ║');
   console.log('╚════════════════════════════════════════════════════════════════════╝\n');
 
-  // Start Dashboard Server (v3.2: localhost bind + optional token auth)
-  const dashToken = process.env.DASHBOARD_TOKEN;
-  startDashboard({ port: 3001, token: dashToken });
-  console.log(`\n🌐 Dashboard: http://localhost:3001${dashToken ? `/?token=${dashToken}` : ''}\n`);
+  // Start Dashboard Server (localhost bind + mandatory token auth). The
+  // server reads DASHBOARD_TOKEN itself, generates a random per-run token if
+  // it is unset, and prints the access URL — the env token is never echoed.
+  startDashboard({ port: 3001 });
 
   if (!process.env.POLYMARKET_PRIVATE_KEY) {
     log('ERROR', 'POLYMARKET_PRIVATE_KEY not found');
@@ -1502,7 +1694,8 @@ async function main() {
       trades: 0,
       totalVolume: 0,
     };
-    log('INFO', '📝 Paper Trading Activated: Simulating trades with $250 initial capital');
+    log('INFO', `📝 Paper Trading Activated: Simulating trades with $${CONFIG.capital.totalUsd} initial capital`);
+    loadPaperLedger(); // unresolved copies from a previous session keep being scored
     updateDashboard();
   }
 
@@ -1525,6 +1718,8 @@ async function main() {
   // v3.2: exposure is chain-seeded every 60s; PnL reconciled every 5 min;
   // session history is upserted every 5 min so a crash loses at most that
   setInterval(() => void refreshExposure(sdk), 60_000);
+  setInterval(() => void settlePaperPositions(sdk), PAPER_SETTLE_INTERVAL_MS);
+  setInterval(logCopyEngineSummary, 5 * 60_000);
   setInterval(() => void reconcilePnl(), 5 * 60_000);
   setInterval(() => persistSession(), 5 * 60_000);
 
@@ -1551,6 +1746,13 @@ async function main() {
         log('INFO', `Switching to ${enable ? 'DRY RUN' : 'LIVE'} mode... (Requested by user)`);
 
         CONFIG.dryRun = enable;
+        if (!CONFIG.dryRun) {
+          // Paper positions are not real: never carry them into live accounting.
+          const dropped = paperLedger.clear();
+          if (dropped.length > 0) {
+            log('WARN', `Switched to LIVE: discarded ${dropped.length} unsettled paper position(s)`);
+          }
+        }
         if (CONFIG.dryRun && !state.paper) {
           state.paper = {
             balance: CONFIG.capital.totalUsd,
@@ -1560,6 +1762,9 @@ async function main() {
             totalVolume: 0,
           };
         }
+
+        // Back to DRY RUN: bring back the paper positions saved before LIVE.
+        if (CONFIG.dryRun) loadPaperLedger();
 
         // Restart mode-sensitive services
         stopSmartMoneyCopy();
@@ -1778,6 +1983,15 @@ async function main() {
 
   process.on('SIGINT', async () => {
     console.log('\n\nShutting down...');
+    // Last chance to score paper positions whose markets have resolved,
+    // then say plainly what is still open (those are NOT in the PnL).
+    try {
+      await Promise.race([settlePaperPositions(sdk), new Promise(resolve => setTimeout(resolve, 5000))]);
+    } catch { /* best effort */ }
+    if (paperLedger.openCount() > 0) {
+      console.log(`📝 ${paperLedger.openCount()} paper position(s) still unresolved — $${paperLedger.openCostUsd().toFixed(2)} at risk, not counted in PnL`);
+    }
+    savePaperLedger();
     persistSession(); // final history checkpoint
     stopSmartMoneyCopy();
     if (arbService) await arbService.stop();

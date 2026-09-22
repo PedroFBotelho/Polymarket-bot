@@ -71,7 +71,11 @@ export function BalanceCards({ state, config }: BalanceCardsProps) {
           icon="🔁"
           label="Sim Trades"
           value={String(paper.trades)}
-          subLabel="This session"
+          subLabel={
+            paper.openPositions
+              ? `${paper.openPositions} open · $${formatCurrency(paper.openCostUsd ?? 0)}`
+              : 'This session'
+          }
           gradient="bg-gradient-to-br from-purple-500/10 to-purple-500/5"
           iconBg="bg-purple-500/20"
         />

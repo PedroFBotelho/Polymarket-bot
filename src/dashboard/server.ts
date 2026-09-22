@@ -6,17 +6,24 @@
  *   startDashboard(3001);
  *   startDashboard({ port: 3001, host: '127.0.0.1', token: 'secret' });
  *
- * Security defaults (v3.2): binds 127.0.0.1 (override with the `host`
- * option or DASHBOARD_HOST env) and — when DASHBOARD_TOKEN (or the `token`
- * option) is set — requires that token on /api/* requests and the
- * WebSocket upgrade. Browser WebSockets cannot set headers, so the token
- * rides the URL query: ws://host:port/?token=... Static files and /health
- * stay open (the app shell contains no data).
+ * Security defaults: binds 127.0.0.1 (override with the `host` option or
+ * DASHBOARD_HOST env) and ALWAYS requires a token on /api/* requests and the
+ * WebSocket upgrade (which carries trading commands). The token comes from
+ * the `token` option or DASHBOARD_TOKEN; when neither is set a random one is
+ * generated for this run and printed once at startup. Browser WebSockets
+ * cannot set headers, so the token rides the URL query:
+ * ws://host:port/?token=... HTTP clients should prefer the
+ * `Authorization: Bearer` header. Static files and /health stay open (the
+ * app shell contains no data).
+ *
+ * When bound to a loopback address the Host header must also be a loopback
+ * name, which blocks DNS-rebinding reads from a hostile web page.
  */
 
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { dashboardEmitter } from './state-emitter.js';
@@ -32,11 +39,34 @@ export interface DashboardOptions {
   port?: number;
   /** Bind address. Default 127.0.0.1 (localhost only). Use '0.0.0.0' to expose. */
   host?: string;
-  /** When set, required on /api/* and the WebSocket upgrade. */
+  /** Required on /api/* and the WebSocket upgrade. Random per-run token if omitted. */
   token?: string;
 }
 
 const LOCAL_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+const MIN_TOKEN_LENGTH = 16;
+/** Commands are tiny JSON objects; the ws default (100 MiB) is a memory-exhaustion vector. */
+const MAX_WS_PAYLOAD = 64 * 1024;
+
+function isLoopbackBind(host: string): boolean {
+  return LOOPBACK_HOSTS.has(host.toLowerCase());
+}
+
+/** Hostname of a Host header value, without port ("[::1]:3001" -> "[::1]"). */
+function hostnameOf(hostHeader: string | undefined): string {
+  if (!hostHeader) return '';
+  const h = hostHeader.toLowerCase();
+  if (h.startsWith('[')) return h.slice(0, h.indexOf(']') + 1);
+  return h.split(':')[0];
+}
+
+/** Constant-time string compare (hashing first equalises lengths). */
+function tokenMatches(provided: string, expected: string): boolean {
+  const a = createHash('sha256').update(provided).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
+}
 
 function broadcast(message: WebSocketMessage): void {
   if (!wss) return;
@@ -51,9 +81,27 @@ function broadcast(message: WebSocketMessage): void {
 export function startDashboard(options: number | DashboardOptions = 3001): http.Server {
   const port = typeof options === 'number' ? options : (options.port ?? 3001);
   const host = (typeof options === 'object' && options.host) || process.env.DASHBOARD_HOST || '127.0.0.1';
-  const token = (typeof options === 'object' && options.token) || process.env.DASHBOARD_TOKEN || null;
+  const configuredToken = (typeof options === 'object' && options.token) || process.env.DASHBOARD_TOKEN || null;
+  const tokenGenerated = !configuredToken;
+  const token = configuredToken ?? randomBytes(24).toString('hex');
+  const loopbackBind = isLoopbackBind(host);
 
   server = http.createServer((req, res) => {
+    // Anti-DNS-rebinding: a page on evil.com that re-points its DNS at
+    // 127.0.0.1 still sends `Host: evil.com`. Only enforced on loopback
+    // binds; a deliberate LAN bind is guarded by the token alone.
+    if (loopbackBind && !LOOPBACK_HOSTS.has(hostnameOf(req.headers.host))) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid Host header' }));
+      return;
+    }
+
+    // The dashboard exposes panic-sell / mode-toggle buttons: refuse framing
+    // (clickjacking), sniffing, and Referer leaks of the ?token= URL.
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+
     // CORS: reflect localhost origins only (dev on :5173 needs it); remote
     // origins get no CORS header at all instead of the old blanket '*'.
     const origin = req.headers.origin;
@@ -72,19 +120,21 @@ export function startDashboard(options: number | DashboardOptions = 3001): http.
 
     const url = new URL(req.url || '/', `http://localhost:${port}`);
 
-    // v3.2 auth: /api/* requires the token when one is configured.
-    // Static files and /health stay open — the app shell has no data.
-    // Exact first-segment match (a startsWith('/api/') gate would let
-    // lookalike paths through if future routes are added).
-    if (token && url.pathname.split('/')[1] === 'api') {
-      const provided = url.searchParams.get('token')
-        ?? (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null);
+    // Auth: /api/* always requires the token. Static files and /health stay
+    // open — the app shell has no data. Exact first-segment match (a
+    // startsWith('/api/') gate would let lookalike paths through if future
+    // routes are added). The Bearer header wins over the query param so
+    // non-browser clients don't need to put the secret in a URL.
+    if (url.pathname.split('/')[1] === 'api') {
+      res.setHeader('Cache-Control', 'no-store');
+      const provided = (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null)
+        ?? url.searchParams.get('token');
       if (!provided) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Token required' }));
         return;
       }
-      if (provided !== token) {
+      if (!tokenMatches(provided, token)) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid token' }));
         return;
@@ -178,9 +228,14 @@ export function startDashboard(options: number | DashboardOptions = 3001): http.
 
   // v3.2 auth: manual upgrade so the token can be checked before the WS
   // handshake completes (browser WebSockets cannot send auth headers).
-  wss = new WebSocketServer({ noServer: true });
+  wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD });
 
   server.on('upgrade', (req, socket, head) => {
+    if (loopbackBind && !LOOPBACK_HOSTS.has(hostnameOf(req.headers.host))) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     // Cross-site WS hijack guard: browsers always send Origin on WS; a page
     // on another site must not be able to open this socket and send
     // commands. Non-browser clients (no Origin) are allowed through this
@@ -191,13 +246,13 @@ export function startDashboard(options: number | DashboardOptions = 3001): http.
       socket.destroy();
       return;
     }
-    if (token) {
-      const u = new URL(req.url || '/', `http://localhost:${port}`);
-      if (u.searchParams.get('token') !== token) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-      }
+    // Token is mandatory: this socket carries trading commands.
+    const u = new URL(req.url || '/', `http://localhost:${port}`);
+    const provided = u.searchParams.get('token');
+    if (!provided || !tokenMatches(provided, token)) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
     }
     wss!.handleUpgrade(req, socket, head, (ws) => wss!.emit('connection', ws, req));
   });
@@ -248,7 +303,18 @@ export function startDashboard(options: number | DashboardOptions = 3001): http.
 
   server.listen(port, host, () => {
     const shownUrl = `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`;
-    console.log(`[Dashboard] Server running at ${shownUrl}${token ? ' (API/WS token required)' : ''}`);
+    console.log(`[Dashboard] Server running at ${shownUrl} (API/WS token required)`);
+    if (tokenGenerated) {
+      // Printed once to the console only — never logged through the
+      // dashboard emitter, which would broadcast it to connected clients.
+      console.log(`[Dashboard] Random token for this run — open: ${shownUrl}/?token=${token}`);
+      console.log('[Dashboard] Set DASHBOARD_TOKEN in .env to use a fixed token instead.');
+    } else {
+      console.log('[Dashboard] Using DASHBOARD_TOKEN — open the URL with ?token=<your token> appended.');
+      if (token.length < MIN_TOKEN_LENGTH) {
+        console.log(`[Dashboard] ⚠️  Token is shorter than ${MIN_TOKEN_LENGTH} chars — use a long random string (e.g. \`openssl rand -hex 24\`).`);
+      }
+    }
     if (host === '0.0.0.0') {
       console.log('[Dashboard] ⚠️  Bound to ALL interfaces — anyone on your network can reach this dashboard.');
     }

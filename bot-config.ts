@@ -45,10 +45,18 @@ import {
   type RiskIntent,
 } from './src/utils/risk.js';
 import { fetchClosedPnls } from './src/utils/closed-positions.js';
+import { parseWalletList } from './src/utils/wallet-list.js';
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
+
+// Wallets to follow on top of the leaderboard: CUSTOM_WALLETS in .env
+// (comma-separated). Typos are reported, never silently dropped.
+const CUSTOM_WALLETS = parseWalletList(process.env.CUSTOM_WALLETS);
+if (CUSTOM_WALLETS.invalid.length > 0) {
+  console.warn(`[config] CUSTOM_WALLETS: ignoring ${CUSTOM_WALLETS.invalid.length} invalid entr${CUSTOM_WALLETS.invalid.length === 1 ? 'y' : 'ies'} (expected 0x + 40 hex chars): ${CUSTOM_WALLETS.invalid.join(', ')}`);
+}
 
 const CONFIG = {
   capital: {
@@ -107,12 +115,11 @@ const CONFIG = {
     maxSlippage: 0.03,
     minTradeSize: 10,
     delay: 500,
-    // ADD YOUR CUSTOM WALLETS HERE (will be followed in addition to leaderboard)
-    customWallets: [
-      '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',  // Top Polymarket trader
-      '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',  // simonbanza
-      // Add more wallet addresses here...
-    ] as string[],
+    // Custom wallets (followed in addition to the leaderboard) come from the
+    // CUSTOM_WALLETS env var (see CUSTOM_WALLETS above). Empty by default. Each
+    // one must still pass the quality gates above: a rejected wallet is logged
+    // ("Custom wallet rejected") and NOT followed.
+    customWallets: CUSTOM_WALLETS.wallets,
   },
 
   arbitrage: {

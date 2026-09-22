@@ -126,6 +126,19 @@ export interface SmartMoneyWallet {
 }
 
 /**
+ * What our own copy of a whale trade was sized to. Distinct from the whale's
+ * print: `size`/`usdcAmount` are AFTER sizeScale and the maxSizePerTrade cap.
+ */
+export interface CopyFill {
+  /** Tokens (shares) in our copy. */
+  size: number;
+  /** Notional (USDC) of our copy — what a live order would spend/receive. */
+  usdcAmount: number;
+  /** Slippage-adjusted limit price used for the copy. */
+  price: number;
+}
+
+/**
  * Smart Money trade from Activity WebSocket
  */
 export interface SmartMoneyTrade {
@@ -220,8 +233,20 @@ export interface AutoCopyTradingOptions {
    */
   preExecutionGuard?: PreExecutionGuard;
 
-  /** Callbacks */
-  onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
+  /**
+   * Callbacks.
+   * `trade` is the WHALE's print (its size, its price). `copy` is what OUR
+   * copy actually sized to (after sizeScale and maxSizePerTrade) — use it,
+   * not `trade.size * trade.price`, for any volume/exposure accounting.
+   */
+  onTrade?: (trade: SmartMoneyTrade, result: OrderResult, copy: CopyFill) => void;
+  /**
+   * Fired when a followed wallet's trade is NOT copied, with the reason and a
+   * short human detail (e.g. "spread 3.1% > 2%"). Counts are also kept in
+   * stats.skipReasons. Can be chatty: `below_min_value` fires for every small
+   * print, so callers usually log only the interesting reasons.
+   */
+  onSkip?: (trade: SmartMoneyTrade, reason: CopySkipReason, detail?: string) => void;
   /**
    * Fired when an executed copy closes (part of) a tracked lot, with the
    * realized PnL for that close (USDC, net of estimated fees). This is the
@@ -258,7 +283,24 @@ export interface AutoCopyTradingStats {
   quoteGuardSkipped: number;
   /** Per-wallet rolling counters (keyed by lowercase address) */
   perWallet: Record<string, { detected: number; executed: number; skipped: number; failed: number }>;
+  /** Why followed-wallet trades were NOT copied, by reason (sums to tradesSkipped) */
+  skipReasons: Record<CopySkipReason, number>;
 }
+
+/**
+ * Why a followed wallet's trade was not copied. Every skip in the copy
+ * engine carries exactly one of these, so "detected but nothing copied" is
+ * always explainable.
+ */
+export type CopySkipReason =
+  | 'wallet_cooldown'   // per-wallet circuit breaker is open
+  | 'below_min_value'   // whale trade notional < minTradeSize
+  | 'side_filter'       // excluded by sideFilter
+  | 'stale'             // whale print older than maxStalenessMs
+  | 'below_min_order'   // scaled copy < Polymarket's $1 minimum order
+  | 'no_token'          // activity print carried no token id
+  | 'quote_guard'       // live spread / premium / liquidity guard failed
+  | 'risk_guard';       // preExecutionGuard (risk limits) blocked the BUY
 
 /**
  * Per-wallet copy health used for the rolling circuit breaker.
@@ -801,7 +843,15 @@ export class SmartMoneyService {
   private cacheTimestamp: number = 0;
 
   private activeSubscription: { unsubscribe: () => void } | null = null;
-  private tradeHandlers: Set<(trade: SmartMoneyTrade) => void> = new Set();
+  /**
+   * Each handler carries ITS OWN filter. (This used to be a Set, with the
+   * shared activity subscription bound to the FIRST subscriber's options, so
+   * an unfiltered early subscriber silently un-filtered everyone after it.)
+   */
+  private tradeHandlers: Map<
+    (trade: SmartMoneyTrade) => void,
+    { addresses: Set<string> | null; minSize: number; smartMoneyOnly: boolean }
+  > = new Map();
   private marketService: MarketService | null = null;
   private walletHealth: Map<string, CopyWalletHealth> = new Map();
   private liveQuoteWarningLogged = false;
@@ -1011,7 +1061,13 @@ export class SmartMoneyService {
       smartMoneyOnly?: boolean;
     } = {}
   ): { id: string; unsubscribe: () => void } {
-    this.tradeHandlers.add(onTrade);
+    this.tradeHandlers.set(onTrade, {
+      addresses: options.filterAddresses?.length
+        ? new Set(options.filterAddresses.map(a => a.toLowerCase()))
+        : null,
+      minSize: options.minSize ?? 0,
+      smartMoneyOnly: options.smartMoneyOnly ?? false,
+    });
 
     // Ensure cache is populated
     this.getSmartMoneyList().catch(() => {});
@@ -1020,7 +1076,7 @@ export class SmartMoneyService {
     if (!this.activeSubscription) {
       this.activeSubscription = this.realtimeService.subscribeAllActivity({
         onTrade: (activityTrade: ActivityTrade) => {
-          this.handleActivityTrade(activityTrade, options);
+          this.handleActivityTrade(activityTrade);
         },
         onError: (error) => {
           console.error('[SmartMoneyService] Subscription error:', error);
@@ -1040,27 +1096,12 @@ export class SmartMoneyService {
     };
   }
 
-  private async handleActivityTrade(
-    trade: ActivityTrade,
-    options: { filterAddresses?: string[]; minSize?: number; smartMoneyOnly?: boolean }
-  ): Promise<void> {
+  private async handleActivityTrade(trade: ActivityTrade): Promise<void> {
     const rawAddress = trade.trader?.address;
     if (!rawAddress) return;
 
     const traderAddress = rawAddress.toLowerCase();
-
-    // Address filter
-    if (options.filterAddresses && options.filterAddresses.length > 0) {
-      const normalized = options.filterAddresses.map(a => a.toLowerCase());
-      if (!normalized.includes(traderAddress)) return;
-    }
-
-    // Size filter
-    if (options.minSize && trade.size < options.minSize) return;
-
-    // Smart Money filter
     const isSmartMoney = this.smartMoneySet.has(traderAddress);
-    if (options.smartMoneyOnly && !isSmartMoney) return;
 
     const smartMoneyTrade: SmartMoneyTrade = {
       traderAddress,
@@ -1078,7 +1119,11 @@ export class SmartMoneyService {
       smartMoneyInfo: this.smartMoneyCache.get(traderAddress),
     };
 
-    for (const handler of this.tradeHandlers) {
+    for (const [handler, filter] of this.tradeHandlers) {
+      // Per-handler filters (address / minimum size / smart-money only)
+      if (filter.addresses && !filter.addresses.has(traderAddress)) continue;
+      if (filter.minSize && trade.size < filter.minSize) continue;
+      if (filter.smartMoneyOnly && !isSmartMoney) continue;
       try {
         handler(smartMoneyTrade);
       } catch (error) {
@@ -1152,6 +1197,16 @@ export class SmartMoneyService {
       realizedPnlUsd: 0,
       staleSkipped: 0,
       quoteGuardSkipped: 0,
+      skipReasons: {
+        wallet_cooldown: 0,
+        below_min_value: 0,
+        side_filter: 0,
+        stale: 0,
+        below_min_order: 0,
+        no_token: 0,
+        quote_guard: 0,
+        risk_guard: 0,
+      },
       perWallet: {},
     };
 
@@ -1184,6 +1239,17 @@ export class SmartMoneyService {
       );
     }
 
+    // Every skip carries a reason: counted in stats.skipReasons and surfaced
+    // through onSkip, so "detected but not copied" is always explainable.
+    const skip = (trade: SmartMoneyTrade, walletAddr: string, reason: CopySkipReason, detail?: string) => {
+      stats.tradesSkipped++;
+      stats.skipReasons[reason]++;
+      this.bumpWalletCounter(stats, walletAddr, 'skipped');
+      try {
+        options.onSkip?.(trade, reason, detail);
+      } catch { /* a logging callback must never break copying */ }
+    };
+
     // Subscribe
     const subscription = this.subscribeSmartMoneyTrades(
       async (trade: SmartMoneyTrade) => {
@@ -1200,30 +1266,27 @@ export class SmartMoneyService {
           // P9: per-wallet circuit breaker (rolling health)
           const health = this.getOrCreateWalletHealth(walletAddr);
           if (Date.now() < health.disabledUntil) {
-            stats.tradesSkipped++;
-            this.bumpWalletCounter(stats, walletAddr, 'skipped');
+            skip(trade, walletAddr, 'wallet_cooldown', `circuit breaker open ${Math.ceil((health.disabledUntil - Date.now()) / 60000)} more min`);
             return;
           }
 
           // Filters
           const tradeValue = trade.size * trade.price;
           if (tradeValue < minTradeSize) {
-            stats.tradesSkipped++;
-            this.bumpWalletCounter(stats, walletAddr, 'skipped');
+            skip(trade, walletAddr, 'below_min_value', `whale $${tradeValue.toFixed(2)} < $${minTradeSize}`);
             return;
           }
 
           if (sideFilter && trade.side !== sideFilter) {
-            stats.tradesSkipped++;
-            this.bumpWalletCounter(stats, walletAddr, 'skipped');
+            skip(trade, walletAddr, 'side_filter', `${trade.side} excluded (only ${sideFilter})`);
             return;
           }
 
           // P5: staleness guard — a delayed whale print is adverse selection
-          if (Date.now() - trade.timestamp > maxStalenessMs) {
-            stats.tradesSkipped++;
+          const ageMs = Date.now() - trade.timestamp;
+          if (ageMs > maxStalenessMs) {
             stats.staleSkipped++;
-            this.bumpWalletCounter(stats, walletAddr, 'skipped');
+            skip(trade, walletAddr, 'stale', `print ${(ageMs / 1000).toFixed(1)}s old > ${(maxStalenessMs / 1000).toFixed(0)}s`);
             return;
           }
 
@@ -1240,8 +1303,7 @@ export class SmartMoneyService {
           // Polymarket minimum order is $1
           const MIN_ORDER_SIZE = 1;
           if (copyValue < MIN_ORDER_SIZE) {
-            stats.tradesSkipped++;
-            this.bumpWalletCounter(stats, walletAddr, 'skipped');
+            skip(trade, walletAddr, 'below_min_order', `copy $${copyValue.toFixed(2)} < $${MIN_ORDER_SIZE} minimum order`);
             return;
           }
 
@@ -1253,8 +1315,7 @@ export class SmartMoneyService {
           // Token
           const tokenId = trade.tokenId;
           if (!tokenId) {
-            stats.tradesSkipped++;
-            this.bumpWalletCounter(stats, walletAddr, 'skipped');
+            skip(trade, walletAddr, 'no_token', 'activity print had no token id');
             return;
           }
 
@@ -1262,6 +1323,7 @@ export class SmartMoneyService {
           // Reference price for premium guard + protection cap.
           let referencePrice = trade.price;
           let quoteGuardFailed = false;
+          const quoteGuardReasons: string[] = []; // every check that failed, in order
           if (this.marketService) {
             try {
               const book = await this.marketService.getTokenOrderbook(tokenId);
@@ -1273,17 +1335,26 @@ export class SmartMoneyService {
                 bestAsk > 0 && bestBid > 0
               ) {
                 const spreadPct = (bestAsk - bestBid) / bestAsk;
-                if (spreadPct > maxSpreadPct) quoteGuardFailed = true;
+                if (spreadPct > maxSpreadPct) {
+                  quoteGuardFailed = true;
+                  quoteGuardReasons.push(`spread ${(spreadPct * 100).toFixed(1)}% > ${(maxSpreadPct * 100).toFixed(0)}%`);
+                }
 
                 // Premium guard: skip when the market already ran past the whale
                 const liveRef = trade.side === 'BUY' ? bestAsk : bestBid;
                 const premium = trade.side === 'BUY'
                   ? (liveRef - trade.price) / trade.price
                   : (trade.price - liveRef) / trade.price;
-                if (premium > maxCopyPremiumPct) quoteGuardFailed = true;
+                if (premium > maxCopyPremiumPct) {
+                  quoteGuardFailed = true;
+                  quoteGuardReasons.push(`market already moved ${(premium * 100).toFixed(1)}% past the whale (> ${(maxCopyPremiumPct * 100).toFixed(0)}%)`);
+                }
 
                 // Liquidity guard: top-of-book must absorb the copy
-                if (trade.side === 'BUY' && bestAskSize < copySize) quoteGuardFailed = true;
+                if (trade.side === 'BUY' && bestAskSize < copySize) {
+                  quoteGuardFailed = true;
+                  quoteGuardReasons.push(`top-of-book only ${bestAskSize.toFixed(1)} sh < ${copySize.toFixed(1)} needed`);
+                }
 
                 if (!quoteGuardFailed) referencePrice = liveRef;
               }
@@ -1294,9 +1365,8 @@ export class SmartMoneyService {
           }
 
           if (quoteGuardFailed) {
-            stats.tradesSkipped++;
             stats.quoteGuardSkipped++;
-            this.bumpWalletCounter(stats, walletAddr, 'skipped');
+            skip(trade, walletAddr, 'quote_guard', quoteGuardReasons.join('; ') || 'live quote guard failed');
             return;
           }
 
@@ -1317,8 +1387,7 @@ export class SmartMoneyService {
               marketKey: trade.conditionId ?? trade.marketSlug ?? 'unknown',
             });
             if (blockReason) {
-              stats.tradesSkipped++;
-              this.bumpWalletCounter(stats, walletAddr, 'skipped');
+              skip(trade, walletAddr, 'risk_guard', blockReason);
               return;
             }
           }
@@ -1373,13 +1442,15 @@ export class SmartMoneyService {
             this.bumpWalletCounter(stats, walletAddr, 'failed');
           }
 
-          options.onTrade?.(trade, result);
+          options.onTrade?.(trade, result, { size: copySize, usdcAmount, price: slippagePrice });
         } catch (error) {
           stats.tradesFailed++;
           options.onError?.(error instanceof Error ? error : new Error(String(error)));
         }
       },
-      { filterAddresses: targetAddresses, minSize: minTradeSize }
+      // No minSize here on purpose: the engine applies minTradeSize itself (in
+      // USD) so that small prints are COUNTED as skips instead of vanishing.
+      { filterAddresses: targetAddresses }
     );
 
     return {
@@ -1389,7 +1460,7 @@ export class SmartMoneyService {
       isActive: true,
       stats,
       stop: () => subscription.unsubscribe(),
-      getStats: () => ({ ...stats }),
+      getStats: () => ({ ...stats, skipReasons: { ...stats.skipReasons } }),
     };
   }
 
