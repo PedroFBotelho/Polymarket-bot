@@ -158,8 +158,13 @@ WantedBy=multi-user.target
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now polybot
-journalctl -u polybot -f          # logs; o token aleatório só é impresso se DASHBOARD_TOKEN não estiver definido
+sudo journalctl -u polybot -f     # logs; o token aleatório só é impresso se DASHBOARD_TOKEN não estiver definido
 ```
+
+> **`journalctl -u polybot` sem `sudo` não mostra nada** (só um aviso sobre os grupos `adm`/`systemd-journal`),
+> mesmo com o serviço rodando — porque o `polybot` roda como um usuário diferente do seu login (`polymarket`
+> etc.), e o journal só mostra logs de outro usuário pra quem é root ou está num desses grupos. Sempre com
+> `sudo`. Pra confirmar o estado do serviço antes de olhar logs: `sudo systemctl status polybot`.
 
 ## 5. Acessar a dashboard: WireGuard (vários dispositivos) ou túnel SSH (um só)
 
