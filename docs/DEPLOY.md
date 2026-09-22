@@ -308,7 +308,11 @@ abrir túnel manualmente a cada vez.
 3. **Vá para LIVE**: `DRY_RUN=false` em `/etc/polybot/polybot.env` e `sudo systemctl restart polybot`.
    Na primeira subida em LIVE o bot **envia aprovações on-chain sozinho** (`onchain.autoApprove=true`,
    aprovação ilimitada aos contratos da Polymarket). Acompanhe `✅ All approvals ready` e `PnL baseline anchored`.
-4. **Desligue o Direct Trading** na dashboard assim que subir (ele vem `enabled: true` fixo no código).
+4. ~~Desligue o Direct Trading na dashboard assim que subir~~ — conferido em 2026-09-22: em `bot-with-dashboard.ts`
+   (o arquivo que este plano roda) `directTrading.enabled` está fixo em `false` e nada no código o liga em
+   runtime, nem o toggle da dashboard. A afirmação anterior aqui vinha de `bot-config.ts`, que tem `enabled:
+   true` — arquivo diferente do que a unit systemd executa. `TREND_ANALYSIS_ENABLED` só liga a coleta de
+   K-line da Binance (sinal de tendência), não o Direct Trading em si.
 5. **Vigie as primeiras cópias**: confira cada uma na Polygonscan e mantenha o Emergency Stop à mão pelo túnel.
 
 ## 7. Operação
