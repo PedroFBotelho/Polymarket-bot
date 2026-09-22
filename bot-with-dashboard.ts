@@ -17,6 +17,7 @@ import {
   type SmartMoneyTrade,
   type AutoCopyTradingSubscription,
   type DipArbRoundResult,
+  type CopySkipReason,
   OnchainService,
 } from './src/index.js';
 import { CTFClient } from './src/clients/ctf-client.js';
@@ -736,6 +737,49 @@ async function reconcilePnl() {
 // handles stale-print skipping, live re-quotes, per-wallet circuit breaker;
 // riskGuard gates BUY copies; onCopyPnl books realized FIFO PnL.
 // dryRun is captured at subscription start → must restart on mode flip.
+// Why the copy engine did NOT mirror a followed wallet's trade. Small prints,
+// side filters and risk blocks are only counted (the first two are far too
+// chatty; riskGuard already logs its own WARN). Everything else is logged, but
+// capped per reason per summary window so a burst can't bury the activity log.
+const SKIP_LABELS: Record<CopySkipReason, string> = {
+  wallet_cooldown: 'wallet paused after failures',
+  below_min_value: 'too small',
+  side_filter: 'side filter',
+  stale: 'stale print',
+  below_min_order: 'below $1 minimum order',
+  no_token: 'no token id',
+  quote_guard: 'live quote guard',
+  risk_guard: 'risk limits',
+};
+const SKIP_LOG_BUDGET_PER_REASON = 5;
+const skipLogBudget: Partial<Record<CopySkipReason, number>> = {};
+
+function logCopySkip(trade: SmartMoneyTrade, reason: CopySkipReason, detail?: string) {
+  if (reason === 'below_min_value' || reason === 'side_filter' || reason === 'risk_guard') return;
+  const used = skipLogBudget[reason] ?? 0;
+  if (used >= SKIP_LOG_BUDGET_PER_REASON) return; // still counted; shown in the summary
+  skipLogBudget[reason] = used + 1;
+  log('INFO', `⏭️ Not copied — ${SKIP_LABELS[reason]}: ${trade.side} by ${trade.traderAddress.slice(0, 8)}...${detail ? ` (${detail})` : ''}`);
+}
+
+// Periodic scoreboard so "signals but no copies" is never a mystery. Counters
+// are cumulative since the copy engine started.
+function logCopyEngineSummary() {
+  for (const k of Object.keys(skipLogBudget)) delete skipLogBudget[k as CopySkipReason];
+  const s = copySubscription?.getStats();
+  if (!s) return;
+  const mins = Math.max(1, Math.round((Date.now() - s.startTime) / 60000));
+  if (s.tradesDetected === 0) {
+    log('INFO', `📊 Copy engine (${mins}m): no trades from followed wallets yet`);
+    return;
+  }
+  const r = s.skipReasons;
+  const parts = (Object.keys(r) as CopySkipReason[])
+    .filter(k => r[k] > 0)
+    .map(k => `${SKIP_LABELS[k]} ${r[k]}`);
+  log('INFO', `📊 Copy engine (${mins}m): ${s.tradesDetected} followed-wallet trades → ${s.tradesExecuted} copied, ${s.tradesSkipped} skipped${parts.length ? ` [${parts.join(' · ')}]` : ''}`);
+}
+
 async function startSmartMoneyCopy(sdk: PolymarketSDK) {
   if (!CONFIG.smartMoney.enabled || state.followedWallets.length === 0) return;
   if (copySubscription?.isActive) return;
@@ -775,6 +819,7 @@ async function startSmartMoneyCopy(sdk: PolymarketSDK) {
           }
         }
       },
+      onSkip: logCopySkip,
       onCopyPnl: (info) => {
         log('TRADE', `Copy closed ${info.closedSize.toFixed(2)} sh — PnL $${info.realizedUsd.toFixed(2)}`);
         recordRealized(info.realizedUsd);
@@ -937,9 +982,11 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   updateDashboard();
 
   if (qualified.length > 0) {
-    // Subscribe to smart money trades with address filter — SIGNAL FEED ONLY.
-    // Execution lives in startAutoCopyTrading (guard + realized PnL +
-    // circuit breaker); this handler just mirrors trades to the dashboard.
+    // Signal feed for the dashboard — followed wallets ONLY (the filter is
+    // passed as the 2nd argument below; without it this handler used to see
+    // every trade on Polymarket and log them all as "copy signals").
+    // A signal is NOT a copy: execution lives in startAutoCopyTrading (guard +
+    // realized PnL + circuit breaker), which logs why it skips a trade.
     sdk.smartMoney.subscribeSmartMoneyTrades(
       async (trade: SmartMoneyTrade) => {
         if (!CONFIG.smartMoney.enabled) return;
@@ -958,14 +1005,15 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
           state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
         }
 
-        log('SIGNAL', `Copy trade signal from ${trade.traderAddress.slice(0, 10)}...`, {
+        log('SIGNAL', `Followed wallet ${trade.traderAddress.slice(0, 10)}... traded (copy engine decides whether to mirror it)`, {
           market: trade.marketSlug?.slice(0, 50),
           side: trade.side,
           size: trade.size,
           price: trade.price,
         });
         updateDashboard();
-      });
+      },
+      { filterAddresses: qualified });
 
     // v3.2: full auto-copy execution (dry-run simulates fills via the service)
     await startSmartMoneyCopy(sdk);
@@ -1671,6 +1719,7 @@ async function main() {
   // session history is upserted every 5 min so a crash loses at most that
   setInterval(() => void refreshExposure(sdk), 60_000);
   setInterval(() => void settlePaperPositions(sdk), PAPER_SETTLE_INTERVAL_MS);
+  setInterval(logCopyEngineSummary, 5 * 60_000);
   setInterval(() => void reconcilePnl(), 5 * 60_000);
   setInterval(() => persistSession(), 5 * 60_000);
 
