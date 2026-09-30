@@ -5,11 +5,11 @@
  * No private key required - just provide an address.
  *
  * Usage:
- *   npx tsx scripts/check-wallet-balances.ts <address>
- *   npx tsx scripts/check-wallet-balances.ts 0xc2e7800b5af46e6093872b177b7a5e7f0563be51
+ *   npx tsx scripts/wallet/check-wallet-balances.ts <address>
+ *   npx tsx scripts/wallet/check-wallet-balances.ts 0xc2e7800b5af46e6093872b177b7a5e7f0563be51
  */
 
-import { SwapService, POLYGON_TOKENS } from '../src/index.js';
+import { SwapService, POLYGON_TOKENS } from '../../src/index.js';
 
 const TEST_ADDRESS = '0xc2e7800b5af46e6093872b177b7a5e7f0563be51'; // Top Polymarket trader
 
